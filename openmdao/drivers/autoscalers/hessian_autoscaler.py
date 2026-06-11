@@ -3,7 +3,8 @@ import numpy as np
 from openmdao.drivers.autoscalers.autoscaler import Autoscaler
 from openmdao.vectors.optimizer_vector import OptimizerVector
 from openmdao.core.driver import Driver
-
+from openmdao.core.constants import INF_BOUND
+        
 from scipy.sparse.linalg import eigs, LinearOperator
 from .arnoldi_algorithm import sort_eigs, extract_eigpairs
 
@@ -42,16 +43,26 @@ class HessianAutoscaler(Autoscaler):
         """
         super().setup(driver)
         
-        # ensure that only 1 design variable is currently considered
+        # # ensure that only 1 design variable is currently considered
         dv_names = [name for name, meta in driver._designvars.items()
             if not meta.get('discrete', False)]
-        if len(dv_names) != 1:
-            raise RuntimeError("HessianAutoscaler currently supports exactly one continuous design variable.")
+        # if len(dv_names) != 1:
+        #     raise RuntimeError("HessianAutoscaler currently supports exactly one continuous design variable.")
+        
+        if not dv_names:
+            raise RuntimeError("HessianAutoscaler requires at least one continuous design variable.")
         
         x0_vec = driver._vectors['design_var']
         x0_vec.update_from_model(driver, driver_scaling=False)
         x0 = x0_vec.asarray().copy()
         self.n_vars = x0.size
+        
+        # store the slices and sizes of each design variable for later use in apply_jac_scaling(...)
+        self._dv_slices = {}
+        self._dv_sizes = {}
+        for name, meta in x0_vec._meta.items():
+            self._dv_slices[name] = meta['slice']
+            self._dv_sizes[name] = meta['size']
         
         def obj_grad(x):
             return self._gradfunc(driver, x)
@@ -180,7 +191,7 @@ class HessianAutoscaler(Autoscaler):
         else:        
             # use the 
             eigenvals_m, eigenvecs_m = extract_eigpairs(A=Hv, b=b, iter=2*m, m=m)
-
+            print("eigenvalues = ", eigenvals_m)
         return eigenvals_m, eigenvecs_m
     
     def _compute_matrix_M(self):
@@ -386,6 +397,46 @@ class HessianAutoscaler(Autoscaler):
         vec._driver_scaling = True
         return vec
     
+    @staticmethod
+    def update_design_vars(p):
+        """
+        Convert bounded design variables to linear constraints after setup but before final_setup.
+
+        For each design variable that has finite lower or upper bounds, this function adds an
+        equivalent linear constraint on that variable and removes the bounds from the design
+        variable declaration.  This must be called after Problem.setup() but before run_model(), run_driver()
+        or final_setup().
+
+        Parameters
+        ----------
+        p : om.Problem
+            The Problem instance, which must have had setup() called already.
+        """
+
+        for prom_name, meta in p.model.get_design_vars(
+                recurse=True, get_sizes=False, use_prom_ivc=True).items():
+            lb = meta['lower']
+            ub = meta['upper']
+
+            has_lb = np.any(np.asarray(lb) > -INF_BOUND)
+            has_ub = np.any(np.asarray(ub) < INF_BOUND)
+
+            if not has_lb and not has_ub:
+                continue
+
+            con_lower = lb if has_lb else None
+            con_upper = ub if has_ub else None
+
+            p._metadata['static_mode'] = False
+            p.model.add_constraint(prom_name, lower=con_lower, upper=con_upper, linear=True,
+                                ref=meta['ref'], ref0=meta['ref0'],
+                                scaler=meta['scaler'], adder=meta['adder'])
+            p._metadata['static_mode'] = True
+            p.model._static_responses[prom_name] = p.model._responses[prom_name]
+
+            meta['lower'] = -INF_BOUND
+            meta['upper'] = INF_BOUND
+    
     def apply_mult_unscaling(self, desvar_multipliers, con_multipliers):
         """
         Unscale the Lagrange multipliers from optimizer space to model space.
@@ -473,73 +524,218 @@ class HessianAutoscaler(Autoscaler):
     def apply_jac_scaling(self, jac_dict):
         """
         Scale total derivatives from model-space design variables x to optimizer-space
-        variables y for the Hessian autoscaler.
+        variables y.
 
-        For this autoscaler,
+        For HessianAutoscaler:
 
             x = M y
-            f_scaled(y) = f(x)
-            g_scaled(y) = g(x)
 
-        so, by the chain rule,
+        so:
 
-            df/dy = df/dx * M
-            dg/dy = dg/dx * M
+            d(response)/dy = d(response)/dx @ M
 
-        This first implementation supports exactly one continuous vector-valued design
-        variable.
+        For multiple design variables, OpenMDAO may store Jacobian blocks separately
+        by design variable. This method assembles the full d(response)/dx block in
+        contiguous driver design-variable order, applies M, then scatters the result
+        back into the original per-design-variable blocks.
         """
         if not self._has_scaling:
             return
 
-        dv_names = []
-
-        for name, meta in self._var_meta['design_var'].items():
-            if not meta.get('discrete', False):
-                dv_names.append(name)
-
-        if len(dv_names) != 1:
-            raise RuntimeError(
-                "HessianAutoscaler.apply_jac_scaling currently supports exactly one "
-                "continuous vector-valued design variable."
-            )
-
-        dv_name = dv_names[0]
+        if not hasattr(self, '_dv_slices') or not self._dv_slices:
+            return
 
         M = self._compute_matrix_M()
 
-        def _scale_block(block):
-            """Apply J_y = J_x @ M to one Jacobian block in place."""
+        # Use the exact slices from the OptimizerVector used to build x0 and M.
+        dv_slices = self._dv_slices
+        n_total = self.n_vars
+
+        if M.shape != (n_total, n_total):
+            raise RuntimeError(
+                f"HessianAutoscaler M has shape {M.shape}, but the contiguous "
+                f"design-variable vector has size {n_total}."
+            )
+
+        def _as_2d(block):
             arr = np.asarray(block)
 
             if arr.ndim == 1:
-                # Treat a 1D block as one row: shape (n_design_vars,).
-                if arr.size != M.shape[0]:
-                    raise RuntimeError(
-                        f"Cannot scale 1D Jacobian block of size {arr.size}; "
-                        f"expected {M.shape[0]}."
-                    )
-                arr[...] = arr @ M
-            elif arr.ndim == 2:
-                if arr.shape[1] != M.shape[0]:
-                    raise RuntimeError(
-                        f"Cannot scale Jacobian block with shape {arr.shape}; "
-                        f"expected second dimension {M.shape[0]}."
-                    )
-                arr[...] = arr @ M
-            else:
-                raise RuntimeError(
-                    f"Cannot scale Jacobian block with {arr.ndim} dimensions."
-                )
+                return arr.reshape(1, -1), True
 
-        for key, jac_block in jac_dict.items():
-            if isinstance(key, tuple):
-                # Flat dict format: jac_dict[(output_name, input_name)] = block
-                _, in_name = key
-                if in_name == dv_name:
-                    _scale_block(jac_block)
-            else:
-                # Nested dict format: jac_dict[output_name][input_name] = block
-                for in_name, block in jac_block.items():
-                    if in_name == dv_name:
-                        _scale_block(block)
+            if arr.ndim == 2:
+                return arr, False
+
+            raise RuntimeError(
+                f"Cannot scale Jacobian block with {arr.ndim} dimensions."
+            )
+
+        def _scale_nested_output(jac_blocks):
+            """
+            Scale one nested output entry:
+
+                jac_blocks[in_name] = d(output)/d(input)
+
+            This modifies existing blocks in place.
+            """
+            
+            # The first block is used to determine the number of rows in the Jacobian. 
+            # scalar objective or constraint: n_row = 1, 
+            # vector objective or constraint: n_row = size of the output vector
+            # We assume that the columns of each block correspond to contiguous slices
+            # of the design variables, as given by dv_slices. This allows us to assemble 
+            # the full d(response)/dx matrix in the correct order for multiplication with M.
+            first_block = None
+            for in_name in dv_slices:
+                if in_name in jac_blocks:
+                    first_block = jac_blocks[in_name]
+                    break
+
+            if first_block is None:
+                return
+
+            first_arr, first_was_1d = _as_2d(first_block)
+            n_rows = first_arr.shape[0]
+
+            Jx = np.zeros((n_rows, n_total))
+
+            # Assemble d(response)/dx in contiguous design-variable order.
+            for in_name, slc in dv_slices.items():
+                if in_name not in jac_blocks:
+                    continue
+
+                arr, was_1d = _as_2d(jac_blocks[in_name])
+
+                if arr.shape[0] != n_rows:
+                    raise RuntimeError(
+                        f"Jacobian block for '{in_name}' has {arr.shape[0]} rows, "
+                        f"but expected {n_rows}."
+                    )
+
+                # use slice to place the block in the correct columns of Jx
+                if arr.shape[1] != slc.stop - slc.start:
+                    raise RuntimeError(
+                        f"Jacobian block for '{in_name}' has shape {arr.shape}, "
+                        f"but expected second dimension {slc.stop - slc.start}."
+                    )
+
+                Jx[:, slc] = arr
+
+            # Chain rule: d(response)/dy = d(response)/dx @ dx/dy = Jx @ M.
+            Jy = Jx @ M
+
+            # Scatter back into existing OpenMDAO blocks.
+            for in_name, slc in dv_slices.items():
+                if in_name not in jac_blocks:
+                    continue
+
+                block = jac_blocks[in_name]
+                arr = np.asarray(block)
+                piece = Jy[:, slc]
+
+                if arr.ndim == 1:
+                    arr[...] = piece.reshape(-1)
+                else:
+                    arr[...] = piece
+
+        if not jac_dict:
+            return
+
+        first_key = next(iter(jac_dict))
+
+        if isinstance(first_key, tuple):
+            # Flat dict format:
+            #     jac_dict[(out_name, in_name)] = block
+            #
+            # Convert to temporary nested grouping by output name.
+            by_output = {}
+
+            for (out_name, in_name), block in jac_dict.items():
+                if in_name in dv_slices:
+                    by_output.setdefault(out_name, {})[in_name] = block
+
+            for blocks in by_output.values():
+                _scale_nested_output(blocks)
+
+        else:
+            # Nested dict format:
+            #     jac_dict[out_name][in_name] = block
+            for out_name, blocks in jac_dict.items():
+                _scale_nested_output(blocks)
+                
+        
+    # def apply_jac_scaling(self, jac_dict):
+    #     """
+    #     Scale total derivatives from model-space design variables x to optimizer-space
+    #     variables y for the Hessian autoscaler.
+
+    #     For this autoscaler,
+
+    #         x = M y
+    #         f_scaled(y) = f(x)
+    #         g_scaled(y) = g(x)
+
+    #     so, by the chain rule,
+
+    #         df/dy = df/dx * M
+    #         dg/dy = dg/dx * M
+
+    #     This first implementation supports exactly one continuous vector-valued design
+    #     variable.
+    #     """
+    #     if not self._has_scaling:
+    #         return
+
+    #     dv_names = []
+
+    #     for name, meta in self._var_meta['design_var'].items():
+    #         if not meta.get('discrete', False):
+    #             dv_names.append(name)
+
+    #     if len(dv_names) != 1:
+    #         raise RuntimeError(
+    #             "HessianAutoscaler.apply_jac_scaling currently supports exactly one "
+    #             "continuous vector-valued design variable."
+    #         )
+
+    #     dv_name = dv_names[0]
+
+    #     M = self._compute_matrix_M()
+
+    #     def _scale_block(block):
+    #         """Apply J_y = J_x @ M to one Jacobian block in place."""
+    #         arr = np.asarray(block)
+
+    #         if arr.ndim == 1:
+    #             # Treat a 1D block as one row: shape (n_design_vars,).
+    #             if arr.size != M.shape[0]:
+    #                 raise RuntimeError(
+    #                     f"Cannot scale 1D Jacobian block of size {arr.size}; "
+    #                     f"expected {M.shape[0]}."
+    #                 )
+    #             arr[...] = arr @ M
+    #         elif arr.ndim == 2:
+    #             if arr.shape[1] != M.shape[0]:
+    #                 raise RuntimeError(
+    #                     f"Cannot scale Jacobian block with shape {arr.shape}; "
+    #                     f"expected second dimension {M.shape[0]}."
+    #                 )
+    #             arr[...] = arr @ M
+    #         else:
+    #             raise RuntimeError(
+    #                 f"Cannot scale Jacobian block with {arr.ndim} dimensions."
+    #             )
+
+    #     for key, jac_block in jac_dict.items():
+    #         if isinstance(key, tuple):
+    #             # Flat dict format: jac_dict[(output_name, input_name)] = block
+    #             _, in_name = key
+    #             if in_name == dv_name:
+    #                 _scale_block(jac_block)
+    #         else:
+    #             # Nested dict format: jac_dict[output_name][input_name] = block
+    #             for in_name, block in jac_block.items():
+    #                 if in_name == dv_name:
+    #                     _scale_block(block)
+    
+    
