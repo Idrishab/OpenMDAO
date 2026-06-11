@@ -18,14 +18,32 @@ class HessianAutoscaler(Autoscaler):
     
     """
     
-    def __init__(self, m, grad_fd_step=1e-6, use_scipy_eigs=False, b = None):
+    def __init__(self, num_modes, num_krylov = None, grad_fd_step=1e-6, use_scipy_eigs=False, start_vec = None):
+        """
+        Initialize the HessianAutoscaler with the specified parameters.
+        
+        Parameters
+        ----------
+        num_modes : int
+            The number of eigenpairs used for the Hessian-based scaling
+        num_krylov : int, optional
+            The number of Krylov iterations for the Arnoldi method (default is 2*num_modes)
+        grad_fd_step : float, optional
+            The step size for finite difference approximation (default is 1e-6)
+        use_scipy_eigs : bool, optional
+            If True, use Scipy library to compute the eigenpairs (default is False)
+        start_vec : ndarray, optional
+            The starting vector used in the Arnoldi algorithm (default: random if start_vec = None)
+        """
+        
         super().__init__()
-        self.m = m
+        self.m = num_modes
         self.grad_fd_step = grad_fd_step
         self.use_scipy_eigs = use_scipy_eigs
-        self.b = b
-        # self.M = None
-        # self.M_inv = None
+        self.b = start_vec
+        if num_krylov is None:
+            num_krylov = 2*num_modes
+        self.max_iter = num_krylov
         self.eigenvals_m = None
         self.eigenvecs_m = None
         
@@ -143,7 +161,7 @@ class HessianAutoscaler(Autoscaler):
     
         return hessian
     
-    def _get_eigen_decomp(self, gradfunc, m, x, use_scipy_eigs, b = None):
+    def _get_eigen_decomp(self, gradfunc, m, x, use_scipy_eigs, b):
         """
         Compute the eigevalue decomposition using Arnoldi method
         
@@ -178,7 +196,7 @@ class HessianAutoscaler(Autoscaler):
         
         if use_scipy_eigs:
             # use the Scipy library to compute the eigenpairs
-            vals, vecs = eigs(Hv, k=m, which='LM', v0=b, maxiter=2*m, ncv=2*m+1, tol=1e-2) 
+            vals, vecs = eigs(Hv, k=m, which='LM', v0=b, maxiter=self.max_iter) 
             
             # extract the real parts of vals and vecs 
             real_vals = np.real(vals)               
@@ -189,7 +207,7 @@ class HessianAutoscaler(Autoscaler):
         
         else:        
             # use the local implementation of the Arnoldi algorithm
-            eigenvals_m, eigenvecs_m = extract_eigpairs(A=Hv, b=b, iter=2*m, m=m)
+            eigenvals_m, eigenvecs_m = extract_eigpairs(A=Hv, b=b, iter=self.max_iter, m=m)
             print("eigenvalues = ", eigenvals_m)
         return eigenvals_m, eigenvecs_m
     
