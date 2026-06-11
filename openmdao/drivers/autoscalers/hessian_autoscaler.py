@@ -46,8 +46,6 @@ class HessianAutoscaler(Autoscaler):
         # # ensure that only 1 design variable is currently considered
         dv_names = [name for name, meta in driver._designvars.items()
             if not meta.get('discrete', False)]
-        # if len(dv_names) != 1:
-        #     raise RuntimeError("HessianAutoscaler currently supports exactly one continuous design variable.")
         
         if not dv_names:
             raise RuntimeError("HessianAutoscaler requires at least one continuous design variable.")
@@ -179,7 +177,8 @@ class HessianAutoscaler(Autoscaler):
             b = np.random.rand(n_vars)
         
         if use_scipy_eigs:
-            vals, vecs = eigs(Hv, k=m, which='LM', v0=b, maxiter=2*m, ncv=2*m+1, tol=1e-2) #np.sqrt(np.finfo(float).eps))
+            # use the Scipy library to compute the eigenpairs
+            vals, vecs = eigs(Hv, k=m, which='LM', v0=b, maxiter=2*m, ncv=2*m+1, tol=1e-2) 
             
             # extract the real parts of vals and vecs 
             real_vals = np.real(vals)               
@@ -189,7 +188,7 @@ class HessianAutoscaler(Autoscaler):
             eigenvals_m, eigenvecs_m = sort_eigs(unsorted_eigvals=real_vals, unsorted_eigvecs=real_vecs)
         
         else:        
-            # use the 
+            # use the local implementation of the Arnoldi algorithm
             eigenvals_m, eigenvecs_m = extract_eigpairs(A=Hv, b=b, iter=2*m, m=m)
             print("eigenvalues = ", eigenvals_m)
         return eigenvals_m, eigenvecs_m
@@ -664,78 +663,4 @@ class HessianAutoscaler(Autoscaler):
                 _scale_nested_output(blocks)
                 
         
-    # def apply_jac_scaling(self, jac_dict):
-    #     """
-    #     Scale total derivatives from model-space design variables x to optimizer-space
-    #     variables y for the Hessian autoscaler.
-
-    #     For this autoscaler,
-
-    #         x = M y
-    #         f_scaled(y) = f(x)
-    #         g_scaled(y) = g(x)
-
-    #     so, by the chain rule,
-
-    #         df/dy = df/dx * M
-    #         dg/dy = dg/dx * M
-
-    #     This first implementation supports exactly one continuous vector-valued design
-    #     variable.
-    #     """
-    #     if not self._has_scaling:
-    #         return
-
-    #     dv_names = []
-
-    #     for name, meta in self._var_meta['design_var'].items():
-    #         if not meta.get('discrete', False):
-    #             dv_names.append(name)
-
-    #     if len(dv_names) != 1:
-    #         raise RuntimeError(
-    #             "HessianAutoscaler.apply_jac_scaling currently supports exactly one "
-    #             "continuous vector-valued design variable."
-    #         )
-
-    #     dv_name = dv_names[0]
-
-    #     M = self._compute_matrix_M()
-
-    #     def _scale_block(block):
-    #         """Apply J_y = J_x @ M to one Jacobian block in place."""
-    #         arr = np.asarray(block)
-
-    #         if arr.ndim == 1:
-    #             # Treat a 1D block as one row: shape (n_design_vars,).
-    #             if arr.size != M.shape[0]:
-    #                 raise RuntimeError(
-    #                     f"Cannot scale 1D Jacobian block of size {arr.size}; "
-    #                     f"expected {M.shape[0]}."
-    #                 )
-    #             arr[...] = arr @ M
-    #         elif arr.ndim == 2:
-    #             if arr.shape[1] != M.shape[0]:
-    #                 raise RuntimeError(
-    #                     f"Cannot scale Jacobian block with shape {arr.shape}; "
-    #                     f"expected second dimension {M.shape[0]}."
-    #                 )
-    #             arr[...] = arr @ M
-    #         else:
-    #             raise RuntimeError(
-    #                 f"Cannot scale Jacobian block with {arr.ndim} dimensions."
-    #             )
-
-    #     for key, jac_block in jac_dict.items():
-    #         if isinstance(key, tuple):
-    #             # Flat dict format: jac_dict[(output_name, input_name)] = block
-    #             _, in_name = key
-    #             if in_name == dv_name:
-    #                 _scale_block(jac_block)
-    #         else:
-    #             # Nested dict format: jac_dict[output_name][input_name] = block
-    #             for in_name, block in jac_block.items():
-    #                 if in_name == dv_name:
-    #                     _scale_block(block)
-    
     
