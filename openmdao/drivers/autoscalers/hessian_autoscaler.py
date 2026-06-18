@@ -266,6 +266,9 @@ class HessianAutoscaler(Autoscaler):
         
         if np.max(np.abs(self.eigenvals_m)) <= 1e-10:
             My = y
+            issue_warning("HessianAutoscaler: The Hessian is nearly singular or the objective is linear. " 
+                          "Using identity matrix as the scaling matrix.",
+                          category=Warning)
         else:
             tilde_vals = np.copy(self.eigenvals_m)
             for i in range(self.m):
