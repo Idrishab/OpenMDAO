@@ -4,6 +4,7 @@ from openmdao.drivers.autoscalers.autoscaler import Autoscaler
 from openmdao.vectors.optimizer_vector import OptimizerVector
 from openmdao.core.driver import Driver
 from openmdao.core.constants import INF_BOUND
+from openmdao.utils.om_warnings import issue_warning
         
 from scipy.sparse.linalg import eigs, LinearOperator
 from .arnoldi_algorithm import sort_eigs, extract_eigpairs
@@ -72,6 +73,9 @@ class HessianAutoscaler(Autoscaler):
         x0_vec.update_from_model(driver, driver_scaling=False)
         x0 = x0_vec.asarray().copy()
         self.n_vars = x0.size
+        
+        if self.m > self.n_vars:
+            raise RuntimeError(f"Number of modes cannot exceed the number of design variables. There are {self.n_vars} design variables and {self.m} modes.")
         
         # store the slices and sizes of each design variable for later use in apply_jac_scaling(...)
         self._dv_slices = {}
@@ -223,18 +227,23 @@ class HessianAutoscaler(Autoscaler):
             The scaling matrix/preconditioner.
         """
         
-        
-        if np.abs(self.eigenvals_m[self.m - 1]) <= 1e-10:
-            raise ValueError(f"The smallest eigenvalue is approximately zero (value = {self.eigenvals_m[self.m - 1]})")
-        I = np.eye(self.n_vars)
-        tilde_vals = np.copy(self.eigenvals_m)
-        for i in range(self.m):
-            tilde_vals[i] = 1/np.sqrt(np.abs(self.eigenvals_m[i]))
-            
-        tilde_lambda = tilde_vals[self.m - 1]
+        if np.max(np.abs(self.eigenvals_m)) <= 1e-10:
+            M = np.eye(self.n_vars)
+            issue_warning("HessianAutoscaler: The Hessian is nearly singular or the objective is linear. " 
+                          "Using identity matrix as the scaling matrix.",
+                          category=Warning)
+        else:
+            # if np.abs(self.eigenvals_m[self.m - 1]) <= 1e-10:
+            #     raise ValueError(f"The smallest eigenvalue is approximately zero (value = {self.eigenvals_m[self.m - 1]})")
+            I = np.eye(self.n_vars)
+            tilde_vals = np.copy(self.eigenvals_m)
+            for i in range(self.m):
+                tilde_vals[i] = 1/np.sqrt(np.abs(self.eigenvals_m[i]))
+                
+            tilde_lambda = tilde_vals[self.m - 1]
 
-        M = ( self.eigenvecs_m @ np.diag(tilde_vals) ) @ np.transpose(self.eigenvecs_m)
-        M += tilde_lambda * ( I - self.eigenvecs_m @ np.transpose(self.eigenvecs_m) )        
+            M = ( self.eigenvecs_m @ np.diag(tilde_vals) ) @ np.transpose(self.eigenvecs_m)
+            M += tilde_lambda * ( I - self.eigenvecs_m @ np.transpose(self.eigenvecs_m) )        
         
         return M
     
@@ -255,15 +264,18 @@ class HessianAutoscaler(Autoscaler):
             The unscaled design variables. That is x_model = My
         """
         
-        tilde_vals = np.copy(self.eigenvals_m)
-        for i in range(self.m):
-            tilde_vals[i] = 1/np.sqrt(np.abs(self.eigenvals_m[i]))
-            
-        tilde_lambda = tilde_vals[self.m-1]
-        z = np.transpose(self.eigenvecs_m) @ y
+        if np.max(np.abs(self.eigenvals_m)) <= 1e-10:
+            My = y
+        else:
+            tilde_vals = np.copy(self.eigenvals_m)
+            for i in range(self.m):
+                tilde_vals[i] = 1/np.sqrt(np.abs(self.eigenvals_m[i]))
+                
+            tilde_lambda = tilde_vals[self.m-1]
+            z = np.transpose(self.eigenvecs_m) @ y
 
-        My = (self.eigenvecs_m @ (np.diag(tilde_vals) - tilde_lambda * np.eye(self.m))) @ z 
-        My += tilde_lambda * y
+            My = (self.eigenvecs_m @ (np.diag(tilde_vals) - tilde_lambda * np.eye(self.m))) @ z 
+            My += tilde_lambda * y
         return My
 
     def _compute_M_inverse_x(self, x):    
@@ -285,17 +297,19 @@ class HessianAutoscaler(Autoscaler):
         y : 1D array or vector 
             optimization variable (equivalently x_scaled)
         """
-        
-        Im = np.eye(self.m)
-        tilde_vals = np.copy(self.eigenvals_m)
-        for i in range(self.m):
-            tilde_vals[i] = np.sqrt(np.abs(self.eigenvals_m[i]))
-            
-        tilde_lambda = tilde_vals[self.m-1]
-        w = np.transpose(self.eigenvecs_m) @ x
+        if np.max(np.abs(self.eigenvals_m)) <= 1e-10:
+            y = x
+        else:
+            Im = np.eye(self.m)
+            tilde_vals = np.copy(self.eigenvals_m)
+            for i in range(self.m):
+                tilde_vals[i] = np.sqrt(np.abs(self.eigenvals_m[i]))
+                
+            tilde_lambda = tilde_vals[self.m-1]
+            w = np.transpose(self.eigenvecs_m) @ x
 
-        y = (self.eigenvecs_m @ (np.diag(tilde_vals) - tilde_lambda * Im)) @ w + tilde_lambda * x
-        # y_0 = eigenvecs_m @ np.diag(tilde_vals) @ w
+            y = (self.eigenvecs_m @ (np.diag(tilde_vals) - tilde_lambda * Im)) @ w + tilde_lambda * x
+            # y_0 = eigenvecs_m @ np.diag(tilde_vals) @ w
         return y
 
 
@@ -447,7 +461,9 @@ class HessianAutoscaler(Autoscaler):
             p._metadata['static_mode'] = False
             p.model.add_constraint(prom_name, lower=con_lower, upper=con_upper, linear=True,
                                 ref=meta['ref'], ref0=meta['ref0'],
-                                scaler=meta['scaler'], adder=meta['adder'])
+                                scaler=meta['scaler'], adder=meta['adder'],
+                                indices=meta.get('indices'),
+                                flat_indices=meta.get('flat_indices', False))
             p._metadata['static_mode'] = True
             p.model._static_responses[prom_name] = p.model._responses[prom_name]
 
