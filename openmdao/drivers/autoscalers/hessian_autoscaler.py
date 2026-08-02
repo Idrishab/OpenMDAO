@@ -47,6 +47,7 @@ class HessianAutoscaler(Autoscaler):
         self.max_iter = num_krylov
         self.eigenvals_m = None
         self.eigenvecs_m = None
+        self.num_grad_evals = 0
         
     def setup(self, driver: 'Driver'):
         """
@@ -86,10 +87,12 @@ class HessianAutoscaler(Autoscaler):
         
         def obj_grad(x):
             return self._gradfunc(driver, x)
-        self.eigenvals_m, self.eigenvecs_m = self._get_eigen_decomp(gradfunc=obj_grad,
+        eigenvals, self.eigenvecs_m = self._get_eigen_decomp(gradfunc=obj_grad,
                                                                     m=self.m, x=x0, 
                                                                     use_scipy_eigs=self.use_scipy_eigs, 
                                                                     b=self.b)
+        eigenvals = self._clean_eigenvals(eigenvals)
+        self.eigenvals_m = eigenvals.copy()
         
         # reset the model to x0 after the perturbations in _get_eigen_decomp(...)
         x0_vec.set_data(x0, driver_scaling=False)
@@ -130,7 +133,7 @@ class HessianAutoscaler(Autoscaler):
             return_format='array',
             driver_scaling=False,
         )
-
+        self.num_grad_evals += 1
         return totals[0, :].copy()
     
     def _compute_Hv(self, gradfunc, x, grad_fd_step):
@@ -214,6 +217,29 @@ class HessianAutoscaler(Autoscaler):
             eigenvals_m, eigenvecs_m = extract_eigpairs(A=Hv, b=b, iter=self.max_iter, m=m)
             print("eigenvalues = ", eigenvals_m)
         return eigenvals_m, eigenvecs_m
+    
+    def _clean_eigenvals(self, eigenvals):
+        """
+        Clean the eigenvalues by removing any that are nearly zero.
+        
+        Parameters
+        ----------
+        eigenvals : array
+            Array of eigenvalues
+            
+        Returns
+        -------
+        cleaned_eigenvals : array
+            Array of cleaned eigenvalues
+        """
+        if eigenvals[0] <= 1e-10:
+            return eigenvals
+        
+        for idx, val in enumerate(eigenvals):
+            if np.abs(val) <= 1e-6:
+                eigenvals[idx] = 1e-6
+        
+        return eigenvals
     
     def _compute_matrix_M(self):
         """ 
@@ -698,6 +724,8 @@ class HessianAutoscaler(Autoscaler):
             #     jac_dict[out_name][in_name] = block
             for out_name, blocks in jac_dict.items():
                 _scale_nested_output(blocks)
+                
+        self.num_grad_evals += 1
                 
         
     
