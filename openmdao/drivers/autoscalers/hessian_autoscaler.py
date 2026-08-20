@@ -586,7 +586,7 @@ class HessianAutoscaler(Autoscaler):
     def apply_jac_scaling(self, jac_dict):
         """
         Scale total derivatives from model-space design variables x to optimizer-space
-        variables y.
+        variables y using the low-rank form of the HessianAutoscaler transformation.
 
         For HessianAutoscaler:
 
@@ -596,10 +596,20 @@ class HessianAutoscaler(Autoscaler):
 
             d(response)/dy = d(response)/dx @ M
 
-        For multiple design variables, OpenMDAO may store Jacobian blocks separately
-        by design variable. This method assembles the full d(response)/dx block in
-        contiguous driver design-variable order, applies M, then scatters the result
-        back into the original per-design-variable blocks.
+        The preconditioner has the form:
+
+            M = alpha * I + V * D * V.T
+
+        where V contains the retained Hessian eigenvectors and D is diagonal.
+
+        For design-variable blocks x_i, this avoids assembling the full dense Jx
+        and avoids forming the dense M multiplication directly:
+
+            S = sum_i J_{x_i} @ V_i
+
+            J_{y_j} = alpha * J_{x_j} + S @ D @ V_j.T
+
+        where V_i is the row block of V corresponding to design variable x_i.
         """
         if not self._has_scaling:
             return
@@ -607,26 +617,39 @@ class HessianAutoscaler(Autoscaler):
         if not hasattr(self, '_dv_slices') or not self._dv_slices:
             return
 
-        M = self._compute_matrix_M()
+        if not jac_dict:
+            return
 
-        # Use the exact slices from the OptimizerVector used to build x0 and M.
         dv_slices = self._dv_slices
         n_total = self.n_vars
 
-        if M.shape != (n_total, n_total):
+        V = self.eigenvecs_m
+        eigs_abs = np.abs(self.eigenvals_m)
+
+        if V.shape[0] != n_total:
             raise RuntimeError(
-                f"HessianAutoscaler M has shape {M.shape}, but the contiguous "
-                f"design-variable vector has size {n_total}."
+                f"HessianAutoscaler eigenvector matrix has {V.shape[0]} rows, "
+                f"but the contiguous design-variable vector has size {n_total}."
             )
+
+        if np.any(eigs_abs <= 1e-10):
+            raise RuntimeError(
+                "HessianAutoscaler cannot scale the Jacobian because at least one "
+                "retained Hessian eigenvalue is near zero."
+            )
+
+        tilde_vals = 1.0 / np.sqrt(eigs_abs)
+        alpha = tilde_vals[self.m - 1]
+        beta = tilde_vals - alpha
 
         def _as_2d(block):
             arr = np.asarray(block)
 
             if arr.ndim == 1:
-                return arr.reshape(1, -1), True
+                return arr.reshape(1, -1)
 
             if arr.ndim == 2:
-                return arr, False
+                return arr
 
             raise RuntimeError(
                 f"Cannot scale Jacobian block with {arr.ndim} dimensions."
@@ -634,20 +657,16 @@ class HessianAutoscaler(Autoscaler):
 
         def _scale_nested_output(jac_blocks):
             """
-            Scale one nested output entry:
+            Scale one response/output entry.
 
-                jac_blocks[in_name] = d(output)/d(input)
+            jac_blocks maps:
 
-            This modifies existing blocks in place.
+                design_var_name -> d(response)/d(design_var)
+
+            This modifies jac_blocks in place.
             """
-            
-            # The first block is used to determine the number of rows in the Jacobian. 
-            # scalar objective or constraint: n_row = 1, 
-            # vector objective or constraint: n_row = size of the output vector
-            # We assume that the columns of each block correspond to contiguous slices
-            # of the design variables, as given by dv_slices. This allows us to assemble 
-            # the full d(response)/dx matrix in the correct order for multiplication with M.
             first_block = None
+
             for in_name in dv_slices:
                 if in_name in jac_blocks:
                     first_block = jac_blocks[in_name]
@@ -656,52 +675,69 @@ class HessianAutoscaler(Autoscaler):
             if first_block is None:
                 return
 
-            first_arr, first_was_1d = _as_2d(first_block)
+            first_arr = _as_2d(first_block)
             n_rows = first_arr.shape[0]
 
-            Jx = np.zeros((n_rows, n_total))
+            # Compute S = sum_i J_{x_i} @ V_i.
+            # Shape:
+            #   J_{x_i}: (n_rows, size_i)
+            #   V_i:     (size_i, m)
+            #   S:       (n_rows, m)
+            S = np.zeros((n_rows, self.m))
 
-            # Assemble d(response)/dx in contiguous design-variable order.
             for in_name, slc in dv_slices.items():
                 if in_name not in jac_blocks:
                     continue
 
-                arr, was_1d = _as_2d(jac_blocks[in_name])
+                Jxi = _as_2d(jac_blocks[in_name])
+                size_i = slc.stop - slc.start
 
-                if arr.shape[0] != n_rows:
+                if Jxi.shape[0] != n_rows:
                     raise RuntimeError(
-                        f"Jacobian block for '{in_name}' has {arr.shape[0]} rows, "
+                        f"Jacobian block for '{in_name}' has {Jxi.shape[0]} rows, "
                         f"but expected {n_rows}."
                     )
 
-                # use slice to place the block in the correct columns of Jx
-                if arr.shape[1] != slc.stop - slc.start:
+                if Jxi.shape[1] != size_i:
                     raise RuntimeError(
-                        f"Jacobian block for '{in_name}' has shape {arr.shape}, "
-                        f"but expected second dimension {slc.stop - slc.start}."
+                        f"Jacobian block for '{in_name}' has shape {Jxi.shape}, "
+                        f"but expected second dimension {size_i}."
                     )
 
-                Jx[:, slc] = arr
+                Vi = V[slc, :]
+                S += Jxi @ Vi
 
-            # Chain rule: d(response)/dy = d(response)/dx @ dx/dy = Jx @ M.
-            Jy = Jx @ M
+            # Apply the diagonal D cheaply by multiplying columns of S.
+            SD = S * beta
 
-            # Scatter back into existing OpenMDAO blocks.
+            # Scatter J_{y_j} = alpha * J_{x_j} + S D V_j.T back into blocks.
+            #
+            # Note: if jac_blocks is missing a design-variable block, we create it.
+            # This is mathematically important because dense Hessian scaling can make
+            # a previously zero/missing block nonzero.
             for in_name, slc in dv_slices.items():
-                if in_name not in jac_blocks:
-                    continue
+                size_j = slc.stop - slc.start
+                Vj = V[slc, :]
 
-                block = jac_blocks[in_name]
-                arr = np.asarray(block)
-                piece = Jy[:, slc]
+                if in_name in jac_blocks:
+                    old_block = jac_blocks[in_name]
+                    Jxj = _as_2d(old_block)
 
-                if arr.ndim == 1:
-                    arr[...] = piece.reshape(-1)
+                    if Jxj.shape[1] != size_j:
+                        raise RuntimeError(
+                            f"Jacobian block for '{in_name}' has shape {Jxj.shape}, "
+                            f"but expected second dimension {size_j}."
+                        )
+
+                    Jyj = alpha * Jxj + SD @ Vj.T
+
+                    arr = np.asarray(old_block)
+                    if arr.ndim == 1:
+                        arr[...] = Jyj.reshape(-1)
+                    else:
+                        arr[...] = Jyj
                 else:
-                    arr[...] = piece
-
-        if not jac_dict:
-            return
+                    jac_blocks[in_name] = SD @ Vj.T
 
         first_key = next(iter(jac_dict))
 
@@ -709,15 +745,19 @@ class HessianAutoscaler(Autoscaler):
             # Flat dict format:
             #     jac_dict[(out_name, in_name)] = block
             #
-            # Convert to temporary nested grouping by output name.
+            # Group by output, scale, then write any newly-created blocks back into
+            # the original flat dict.
             by_output = {}
 
             for (out_name, in_name), block in jac_dict.items():
                 if in_name in dv_slices:
                     by_output.setdefault(out_name, {})[in_name] = block
 
-            for blocks in by_output.values():
+            for out_name, blocks in by_output.items():
                 _scale_nested_output(blocks)
+
+                for in_name, block in blocks.items():
+                    jac_dict[(out_name, in_name)] = block
 
         else:
             # Nested dict format:
@@ -726,6 +766,150 @@ class HessianAutoscaler(Autoscaler):
                 _scale_nested_output(blocks)
                 
         self.num_grad_evals += 1
+    
+    # def apply_jac_scaling(self, jac_dict):
+    #     """
+    #     Scale total derivatives from model-space design variables x to optimizer-space
+    #     variables y.
+
+    #     For HessianAutoscaler:
+
+    #         x = M y
+
+    #     so:
+
+    #         d(response)/dy = d(response)/dx @ M
+
+    #     For multiple design variables, OpenMDAO may store Jacobian blocks separately
+    #     by design variable. This method assembles the full d(response)/dx block in
+    #     contiguous driver design-variable order, applies M, then scatters the result
+    #     back into the original per-design-variable blocks.
+    #     """
+    #     if not self._has_scaling:
+    #         return
+
+    #     if not hasattr(self, '_dv_slices') or not self._dv_slices:
+    #         return
+
+    #     M = self._compute_matrix_M()
+
+    #     # Use the exact slices from the OptimizerVector used to build x0 and M.
+    #     dv_slices = self._dv_slices
+    #     n_total = self.n_vars
+
+    #     if M.shape != (n_total, n_total):
+    #         raise RuntimeError(
+    #             f"HessianAutoscaler M has shape {M.shape}, but the contiguous "
+    #             f"design-variable vector has size {n_total}."
+    #         )
+
+    #     def _as_2d(block):
+    #         arr = np.asarray(block)
+
+    #         if arr.ndim == 1:
+    #             return arr.reshape(1, -1), True
+
+    #         if arr.ndim == 2:
+    #             return arr, False
+
+    #         raise RuntimeError(
+    #             f"Cannot scale Jacobian block with {arr.ndim} dimensions."
+    #         )
+
+    #     def _scale_nested_output(jac_blocks):
+    #         """
+    #         Scale one nested output entry:
+
+    #             jac_blocks[in_name] = d(output)/d(input)
+
+    #         This modifies existing blocks in place.
+    #         """
+            
+    #         # The first block is used to determine the number of rows in the Jacobian. 
+    #         # scalar objective or constraint: n_row = 1, 
+    #         # vector objective or constraint: n_row = size of the output vector
+    #         # We assume that the columns of each block correspond to contiguous slices
+    #         # of the design variables, as given by dv_slices. This allows us to assemble 
+    #         # the full d(response)/dx matrix in the correct order for multiplication with M.
+    #         first_block = None
+    #         for in_name in dv_slices:
+    #             if in_name in jac_blocks:
+    #                 first_block = jac_blocks[in_name]
+    #                 break
+
+    #         if first_block is None:
+    #             return
+
+    #         first_arr, first_was_1d = _as_2d(first_block)
+    #         n_rows = first_arr.shape[0]
+
+    #         Jx = np.zeros((n_rows, n_total))
+
+    #         # Assemble d(response)/dx in contiguous design-variable order.
+    #         for in_name, slc in dv_slices.items():
+    #             if in_name not in jac_blocks:
+    #                 continue
+
+    #             arr, was_1d = _as_2d(jac_blocks[in_name])
+
+    #             if arr.shape[0] != n_rows:
+    #                 raise RuntimeError(
+    #                     f"Jacobian block for '{in_name}' has {arr.shape[0]} rows, "
+    #                     f"but expected {n_rows}."
+    #                 )
+
+    #             # use slice to place the block in the correct columns of Jx
+    #             if arr.shape[1] != slc.stop - slc.start:
+    #                 raise RuntimeError(
+    #                     f"Jacobian block for '{in_name}' has shape {arr.shape}, "
+    #                     f"but expected second dimension {slc.stop - slc.start}."
+    #                 )
+
+    #             Jx[:, slc] = arr
+
+    #         # Chain rule: d(response)/dy = d(response)/dx @ dx/dy = Jx @ M.
+    #         Jy = Jx @ M
+
+    #         # Scatter back into existing OpenMDAO blocks.
+    #         for in_name, slc in dv_slices.items():
+    #             if in_name not in jac_blocks:
+    #                 continue
+
+    #             block = jac_blocks[in_name]
+    #             arr = np.asarray(block)
+    #             piece = Jy[:, slc]
+
+    #             if arr.ndim == 1:
+    #                 arr[...] = piece.reshape(-1)
+    #             else:
+    #                 arr[...] = piece
+
+    #     if not jac_dict:
+    #         return
+
+    #     first_key = next(iter(jac_dict))
+
+    #     if isinstance(first_key, tuple):
+    #         # Flat dict format:
+    #         #     jac_dict[(out_name, in_name)] = block
+    #         #
+    #         # Convert to temporary nested grouping by output name.
+    #         by_output = {}
+
+    #         for (out_name, in_name), block in jac_dict.items():
+    #             if in_name in dv_slices:
+    #                 by_output.setdefault(out_name, {})[in_name] = block
+
+    #         for blocks in by_output.values():
+    #             _scale_nested_output(blocks)
+
+    #     else:
+    #         # Nested dict format:
+    #         #     jac_dict[out_name][in_name] = block
+    #         for out_name, blocks in jac_dict.items():
+    #             _scale_nested_output(blocks)
+                
+    #     self.num_grad_evals += 1
                 
         
     
