@@ -1,6 +1,7 @@
 import numpy as np
+import weakref
 
-from openmdao.drivers.autoscalers.autoscaler import Autoscaler
+from openmdao.drivers.autoscalers.autoscaler_base import AutoscalerBase
 from openmdao.vectors.optimizer_vector import OptimizerVector
 from openmdao.core.driver import Driver
 from openmdao.core.constants import INF_BOUND
@@ -9,7 +10,7 @@ from openmdao.utils.om_warnings import issue_warning
 from scipy.sparse.linalg import eigs, LinearOperator
 from .arnoldi_algorithm import sort_eigs, extract_eigpairs
 
-class HessianAutoscaler(Autoscaler):
+class HessianAutoscaler(AutoscalerBase):
     """Transform optimizer variables between model and optimizer spaces.
 
     This is the default Autoscaler in OpenMDAO that scales optimization variables based
@@ -48,6 +49,7 @@ class HessianAutoscaler(Autoscaler):
         self.eigenvals_m = None
         self.eigenvecs_m = None
         self.num_grad_evals = 0
+        self.arnoldi_grad_evals = 0
         
     def setup(self, driver: 'Driver'):
         """
@@ -61,9 +63,31 @@ class HessianAutoscaler(Autoscaler):
             True if setup is being called after the model has been run. If not,
             and setup requires run model, it will be executed within setup.
         """
-        super().setup(driver)
+        from openmdao.core.driver import RecordingDebugging
         
-        # # ensure that only 1 design variable is currently considered
+        if self.setup_requires_run_model:
+            with RecordingDebugging(driver._get_name(), driver.iter_count, driver):
+                with driver._problem().model._relevance.nonlinear_active('iter'):
+                    driver._run_solve_nonlinear()
+                driver.iter_count += 1
+
+        self._driver_ref = weakref.ref(driver)
+        self._var_meta : dict[str, dict[str, dict]] = {
+            'design_var': driver._designvars,
+            'constraint': driver._cons,
+            'objective': driver._objs,
+        }
+        
+        # Compute and cache scaled bounds vectors for design vars and constraints
+        self._scaled_lower = {}
+        self._scaled_upper = {}
+        self._scaled_equals = {}
+
+        for voi_type in ['design_var', 'constraint']:
+            self._scaled_lower[voi_type], \
+                self._scaled_upper[voi_type], self._scaled_equals[voi_type] = \
+                self._compute_hessian_bounds(voi_type)
+        
         dv_names = [name for name, meta in driver._designvars.items()
             if not meta.get('discrete', False)]
         
@@ -94,13 +118,81 @@ class HessianAutoscaler(Autoscaler):
         eigenvals = self._clean_eigenvals(eigenvals)
         self.eigenvals_m = eigenvals.copy()
         
+        # I = np.eye(len(x0))
+        # self.eigenvals_m = np.ones(self.m)
+        # self.eigenvecs_m = I[:,:self.m]
+        
+        self.arnoldi_grad_evals = self.num_grad_evals
+        
         # reset the model to x0 after the perturbations in _get_eigen_decomp(...)
         x0_vec.set_data(x0, driver_scaling=False)
         driver._set_design_vars(driver_scaling=False)
         driver._run_solve_nonlinear()
         
         self._has_scaling = True
-                
+    
+    def _as_bound_array(self, val, size, default):
+        if val is None:
+            val = default
+
+        if np.isscalar(val):
+            return np.full(size, val, dtype=float)
+
+        arr = np.asarray(val, dtype=float)
+        if arr.size != size:
+            arr = np.broadcast_to(arr, (size,)).copy()
+        else:
+            arr = arr.copy()
+
+        return arr.ravel()
+    
+    def _compute_hessian_bounds(self, voi_type):
+        vecmeta = {}
+        total_size = 0
+
+        for name, meta in self._var_meta[voi_type].items():
+            if meta.get('discrete', False):
+                continue
+
+            size = meta.get('global_size', meta.get('size', 0)) \
+                if meta.get('distributed', False) else meta.get('size', 0)
+
+            vecmeta[name] = {
+                'slice': slice(total_size, total_size + size),
+                'size': size,
+            }
+            total_size += size
+
+        lower_data = np.empty(total_size)
+        upper_data = np.empty(total_size)
+        equals_data = np.full(total_size, np.nan) if voi_type == 'constraint' else None
+
+        for name, vmeta in vecmeta.items():
+            meta = self._var_meta[voi_type][name]
+            size = vmeta['size']
+            s = vmeta['slice']
+
+            lower_data[s] = self._as_bound_array(meta.get('lower', -INF_BOUND), size, -INF_BOUND)
+            upper_data[s] = self._as_bound_array(meta.get('upper', INF_BOUND), size, INF_BOUND)
+
+            if voi_type == 'constraint':
+                eq = meta.get('equals')
+                if eq is not None:
+                    equals_data[s] = self._as_bound_array(eq, size, np.nan)
+
+        lower_vec = OptimizerVector(voi_type, lower_data, vecmeta)
+        upper_vec = OptimizerVector(voi_type, upper_data, vecmeta)
+        equals_vec = OptimizerVector(voi_type, equals_data, vecmeta) if voi_type == 'constraint' else None
+
+        return lower_vec, upper_vec, equals_vec
+    
+    def get_bounds_scaling(self, voi_type):
+        return (
+            self._scaled_lower[voi_type],
+            self._scaled_upper[voi_type],
+            self._scaled_equals[voi_type],
+        )
+    
     def _gradfunc(self, driver, x):
         """
         Extracts the gradient of the objective function at a design point
@@ -489,8 +581,8 @@ class HessianAutoscaler(Autoscaler):
 
             p._metadata['static_mode'] = False
             p.model.add_constraint(prom_name, lower=con_lower, upper=con_upper, linear=True,
-                                ref=meta['ref'], ref0=meta['ref0'],
-                                scaler=meta['scaler'], adder=meta['adder'],
+                                # ref=meta['ref'], ref0=meta['ref0'],
+                                # scaler=meta['scaler'], adder=meta['adder'],
                                 indices=meta.get('indices'),
                                 flat_indices=meta.get('flat_indices', False))
             p._metadata['static_mode'] = True
